@@ -1,9 +1,8 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
-import { partialParse } from "@anthropic-ai/sdk/_vendor/partial-json-parser/parser";
-import { anthropic, ITINERARY_MODEL } from "@/lib/anthropic";
+import { ndjsonResponse, streamStructured } from "@/lib/claude-stream";
+import { fetchRates, ratesForPrompt } from "@/lib/exchange";
 import { buildUserMessage, SYSTEM_PROMPT } from "@/lib/itinerary-prompt";
 import {
+	applyTravellerCosts,
 	ItinerarySchema,
 	TripInputSchema,
 	type PartialItinerary,
@@ -12,9 +11,6 @@ import {
 
 // Long generations can take a minute or more.
 export const maxDuration = 300;
-
-// How often (ms) to send a partial itinerary to the browser while Claude writes.
-const PARTIAL_INTERVAL_MS = 150;
 
 export async function POST(request: Request) {
 	// 1. Validate the form input. Never trust the browser.
@@ -28,108 +24,38 @@ export async function POST(request: Request) {
 	}
 	const trip = parsed.data;
 
-	const encoder = new TextEncoder();
+	// 2. Stream the itinerary back as it's written, one JSON event per line.
+	return ndjsonResponse<StreamEvent>(request.signal, async (send) => {
+		// Today's rates, so local prices convert with a real rate instead of the
+		// model's memory. If the service is down, Claude plans without them.
+		const rates = await fetchRates(trip.currency, request.signal);
 
-	// 2. Stream newline-delimited JSON (one StreamEvent per line) back to the browser.
-	const stream = new ReadableStream<Uint8Array>({
-		async start(controller) {
-			const send = (event: StreamEvent) =>
-				controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
+		const result = await streamStructured({
+			schema: ItinerarySchema,
+			system: SYSTEM_PROMPT,
+			messages: [{ role: "user", content: buildUserMessage(trip, rates && ratesForPrompt(rates)) }],
+			signal: request.signal,
+			onPartial: (partial) => send({ type: "partial", itinerary: partial as PartialItinerary }),
+		});
 
-			try {
-				// 3. Ask Claude, constrained to the itinerary schema (structured output).
-				const claude = anthropic.beta.messages.stream(
-					{
-						model: ITINERARY_MODEL,
-						max_tokens: 64000,
-						output_config: {
-							effort: "medium",
-							format: betaZodOutputFormat(ItinerarySchema),
-						},
-						// If the model declines on safety grounds, the API retries on a
-						// fallback model inside the same request.
-						betas: ["server-side-fallback-2026-07-01"],
-						fallbacks: "default",
-						system: SYSTEM_PROMPT,
-						messages: [{ role: "user", content: buildUserMessage(trip) }],
-					},
-					// Stop paying for tokens if the user cancels or closes the tab.
-					{ signal: request.signal },
-				);
-
-				// 4. As JSON text arrives, parse what we have so far and forward it.
-				let json = "";
-				let lastSent = 0;
-				for await (const event of claude) {
-					// A new text block (e.g. after a fallback) starts the JSON over.
-					if (event.type === "content_block_start" && event.content_block.type === "text") {
-						json = "";
+		if (!result.ok) {
+			send({ type: "error", message: result.message });
+			return;
+		}
+		// Hotel and flight prices the traveller set always win over the model's numbers.
+		const itinerary = applyTravellerCosts(result.data, trip);
+		// The rate the plan was priced with becomes the one shown in the budget card.
+		const local = itinerary.localCurrency;
+		const exchange =
+			rates && local !== trip.currency && rates.rates[local]
+				? {
+						from: trip.currency,
+						to: local,
+						rate: rates.rates[local],
+						updatedAt: rates.updatedAt,
+						checkedAt: new Date().toISOString(),
 					}
-					if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-						json += event.delta.text;
-						const now = Date.now();
-						if (now - lastSent >= PARTIAL_INTERVAL_MS) {
-							lastSent = now;
-							const partial = tryPartialParse(json);
-							if (partial) send({ type: "partial", itinerary: partial });
-						}
-					}
-				}
-
-				// 5. Check why the model stopped BEFORE trusting the content.
-				const message = await claude.finalMessage();
-				if (message.stop_reason === "refusal") {
-					send({ type: "error", message: "We couldn't plan this trip. Try changing the details." });
-				} else if (message.stop_reason === "max_tokens") {
-					send({ type: "error", message: "The itinerary was too long to finish. Try a shorter trip." });
-				} else if (!message.parsed_output) {
-					send({ type: "error", message: "Something went wrong reading the itinerary. Please try again." });
-				} else {
-					// parsed_output has already been validated against ItinerarySchema.
-					send({ type: "done", itinerary: message.parsed_output });
-				}
-			} catch (error) {
-				if (request.signal.aborted) {
-					// The browser went away; nobody is listening.
-				} else {
-					console.error("[itinerary]", error);
-					send({ type: "error", message: errorMessage(error) });
-				}
-			} finally {
-				try {
-					controller.close();
-				} catch {
-					// Already closed because the client disconnected.
-				}
-			}
-		},
+				: null;
+		send({ type: "done", itinerary, exchange });
 	});
-
-	return new Response(stream, {
-		headers: {
-			"Content-Type": "application/x-ndjson; charset=utf-8",
-			"Cache-Control": "no-cache, no-transform",
-		},
-	});
-}
-
-function tryPartialParse(json: string): PartialItinerary | null {
-	try {
-		return partialParse(json) as PartialItinerary;
-	} catch {
-		return null;
-	}
-}
-
-function errorMessage(error: unknown) {
-	if (error instanceof Anthropic.AuthenticationError) {
-		return "The server's Anthropic API key is missing or invalid.";
-	}
-	if (error instanceof Anthropic.RateLimitError) {
-		return "Too many requests right now. Wait a moment and try again.";
-	}
-	if (error instanceof Anthropic.APIError && (error.status ?? 0) >= 500) {
-		return "Claude is temporarily unavailable. Please try again.";
-	}
-	return "Something went wrong while planning. Please try again.";
 }

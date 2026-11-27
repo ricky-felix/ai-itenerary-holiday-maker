@@ -8,12 +8,14 @@ import {
 	dateRangeLabel,
 	dayLabel,
 	formatMoney,
+	routeLabel,
 	tripDayCount,
 	type PartialItinerary,
 	type StreamEvent,
 	type TripInput,
 } from "@/lib/itinerary-schema";
-import { saveItinerary, useStoredTrip } from "@/lib/trip-session";
+import { readNdjson } from "@/lib/ndjson";
+import { saveExchange, saveItinerary, useStoredTrip } from "@/lib/trip-session";
 
 const heading = "font-[family-name:var(--font-space-grotesk)]";
 const dayLabelCls = "text-[13px] font-semibold tracking-[0.06em] uppercase";
@@ -53,30 +55,20 @@ export function GeneratingView() {
 					return;
 				}
 
-				const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
-				let buffer = "";
 				let finished = false;
-				while (true) {
-					const { value, done } = await reader.read();
-					if (done) break;
-					buffer += value;
-					const lines = buffer.split("\n");
-					buffer = lines.pop() ?? ""; // keep any incomplete line for next time
-					for (const line of lines) {
-						if (!line.trim()) continue;
-						const event = JSON.parse(line) as StreamEvent;
-						if (event.type === "partial") {
-							setPartial(event.itinerary);
-						} else if (event.type === "done") {
-							finished = true;
-							saveItinerary(event.itinerary);
-							router.push("/itinerary");
-						} else {
-							finished = true;
-							setError(event.message);
-						}
+				await readNdjson<StreamEvent>(res, (event) => {
+					if (event.type === "partial") {
+						setPartial(event.itinerary);
+					} else if (event.type === "done") {
+						finished = true;
+						saveItinerary(event.itinerary);
+						if (event.exchange) saveExchange(event.exchange);
+						router.push("/itinerary");
+					} else {
+						finished = true;
+						setError(event.message);
 					}
-				}
+				});
 				if (!finished) setError("The connection dropped before the plan finished. Please try again.");
 			} catch {
 				if (!controller.signal.aborted) {
@@ -116,7 +108,7 @@ export function GeneratingView() {
 						</span>
 					)}
 					<h1 className={`${heading} m-0 text-[clamp(2rem,4vw,3rem)] leading-[1.1] font-bold tracking-[-0.02em]`}>
-						{trip.destination}
+						{routeLabel(trip)}
 					</h1>
 					<p className="m-0 text-[#4A4D55]">{tripSummary(trip)}</p>
 				</div>
@@ -168,9 +160,9 @@ export function GeneratingView() {
 				<section className="flex min-w-0 flex-[999_1_560px] flex-col gap-4" aria-live="polite">
 					{days.map((day, i) =>
 						i === currentIndex ? (
-							<DayCard key={i} day={day} label={`Day ${i + 1} · ${dayLabel(trip.startDate, i)}`} writing />
+							<DayCard key={i} day={day} label={`Day ${i + 1} · ${dayLabel(trip.startDate, i)}${trip.stops.length && day.location ? ` · ${day.location}` : ""}`} writing />
 						) : (
-							<DayCard key={i} day={day} label={`Day ${i + 1} · ${dayLabel(trip.startDate, i)}`} />
+							<DayCard key={i} day={day} label={`Day ${i + 1} · ${dayLabel(trip.startDate, i)}${trip.stops.length && day.location ? ` · ${day.location}` : ""}`} />
 						),
 					)}
 					{Array.from({ length: Math.max(totalDays - days.length, 0) }, (_, k) => {

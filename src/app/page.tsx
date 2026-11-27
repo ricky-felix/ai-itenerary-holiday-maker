@@ -1,3 +1,4 @@
+import { SavedTripsList } from "@/components/saved-trips-list";
 import { SiteHeader } from "@/components/site-header";
 import { TripForm } from "@/components/trip-form";
 
@@ -53,6 +54,8 @@ export default function Home() {
 
 				<TripForm />
 			</main>
+
+			<SavedTripsList />
 		</div>
 	);
 }
